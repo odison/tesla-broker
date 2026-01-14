@@ -1,0 +1,21 @@
+services:
+  tesla-broker:
+    build:
+      context: .
+    image: tesla-broker:local
+    ports:
+      - "8080:8080"
+    environment:
+      # If set, broker requires X-Broker-Secret header
+      # BROKER_SHARED_SECRET: "change-me"
+      BROKER_FLOW_TTL_SECONDS: "600"
+      TESLA_MAX_ATTEMPTS: "7"
+      # Tesla headers/urls (defaults usually fine)
+      TESLA_UA: "UA"
+      TESLA_X_TESLA_USER_AGENT: "UA"
+      # Tesla endpoints (CN)
+      TESLA_AUTHORIZE_URL: "https://auth.tesla.cn/oauth2/v3/authorize"
+      TESLA_TOKEN_URL: "https://auth.tesla.cn/oauth2/v3/token"
+      TESLA_REDIRECT_URI: "https://auth.tesla.com/void/callback"
+      TESLA_CLIENT_ID: "ownerapi"
+    shm_size: "1gb"
