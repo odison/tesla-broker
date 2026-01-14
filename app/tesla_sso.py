@@ -76,10 +76,17 @@ def _initial_headers() -> Dict[str, str]:
     }
 
 
+class NeedsBrowserFallback(Exception):
+    """Raised when HTML doesn't contain expected fields and we need Selenium."""
+    pass
+
+
 def _extract_csrf_and_txid_from_html(html: str) -> tuple[str, str]:
-    csrf = re.search(r'name="_csrf".+value="([^"]+)"', html).group(1)  # type: ignore[union-attr]
-    transaction_id = re.search(r'name="transaction_id".+value="([^"]+)"', html).group(1)  # type: ignore[union-attr]
-    return csrf, transaction_id
+    csrf_match = re.search(r'name="_csrf".+?value="([^"]+)"', html, re.DOTALL)
+    txid_match = re.search(r'name="transaction_id".+?value="([^"]+)"', html, re.DOTALL)
+    if not csrf_match or not txid_match:
+        raise NeedsBrowserFallback("Could not extract csrf/transaction_id from HTML")
+    return csrf_match.group(1), txid_match.group(1)
 
 
 def _extract_csrf_and_txid_via_browser(url: str) -> tuple[str, str, Dict[str, str]]:
@@ -122,12 +129,18 @@ def start_login(email: str, password: str, *, locale: str = "zh-CN") -> StartRes
     session = requests.Session()
     resp = session.get(AUTHORIZE_URL, headers=headers, params=params)
 
-    if "<title>" not in resp.text:
+    # Try HTML extraction first; fallback to browser if it fails
+    try:
+        if "<title>" in resp.text:
+            csrf, transaction_id = _extract_csrf_and_txid_from_html(resp.text)
+        else:
+            raise NeedsBrowserFallback("No <title> in response")
+    except NeedsBrowserFallback:
         csrf, transaction_id, driver_cookies = _extract_csrf_and_txid_via_browser(resp.request.url)
         for k, v in driver_cookies.items():
             session.cookies.set(k, v)
     else:
-        csrf, transaction_id = _extract_csrf_and_txid_from_html(resp.text)
+        pass  # csrf/transaction_id already set
 
     # identity phase
     data = {
@@ -146,12 +159,16 @@ def start_login(email: str, password: str, *, locale: str = "zh-CN") -> StartRes
         allow_redirects=False,
     )
 
-    if "<title>" not in resp.text:
+    # Try HTML extraction first; fallback to browser if it fails
+    try:
+        if "<title>" in resp.text:
+            csrf, transaction_id = _extract_csrf_and_txid_from_html(resp.text)
+        else:
+            raise NeedsBrowserFallback("No <title> in response after identity phase")
+    except NeedsBrowserFallback:
         csrf, transaction_id, driver_cookies = _extract_csrf_and_txid_via_browser(resp.request.url)
         for k, v in driver_cookies.items():
             session.cookies.set(k, v)
-    else:
-        csrf, transaction_id = _extract_csrf_and_txid_from_html(resp.text)
 
     # authenticate phase
     data = {
