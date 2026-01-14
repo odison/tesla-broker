@@ -32,6 +32,7 @@ from playwright.sync_api import (
     BrowserContext,
     Page,
     Playwright,
+    expect,
     sync_playwright,
     TimeoutError as PlaywrightTimeout,
 )
@@ -56,6 +57,50 @@ SCOPES = "openid email offline_access"
 # Timeouts
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30000"))  # 30s
 NAVIGATION_TIMEOUT = int(os.getenv("NAVIGATION_TIMEOUT", "60000"))  # 60s
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_akamai_challenge_page(page: Page) -> bool:
+    try:
+        title = page.title() or ""
+        if title.strip().lower() == "challenge validation":
+            return True
+    except Exception:
+        pass
+
+    # Akamai challenge pages include a dedicated form and hidden wraps.
+    try:
+        if page.locator("form[name='sec_chlge_form']").count() > 0:
+            return True
+        if page.locator("input[name='sec_chlge_forward_wrap']").count() > 0:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _click_primary_submit(page: Page) -> None:
+    # Tesla pages contain multiple forms; the first submit button can be the "back" button.
+    primary = page.locator("#form-submit-continue")
+    if primary.count() > 0:
+        primary.first.click()
+        return
+
+    # Fallback: submit button inside the main form.
+    within_form = page.locator("form#form button[type='submit']")
+    if within_form.count() > 0:
+        within_form.first.click()
+        return
+
+    # Last resort.
+    page.locator("button[type='submit']").last.click()
 
 
 def _generate_pkce() -> tuple[str, str, str]:
@@ -203,12 +248,20 @@ def start_login(
     with sync_playwright() as p:
         # Launch browser with anti-detection settings
         logger.info("Launching browser...")
+
+        headless = _env_flag("PLAYWRIGHT_HEADLESS", True)
+        channel = os.getenv("PLAYWRIGHT_CHANNEL")  # e.g. "chrome" on Windows hosts
+        slow_mo = int(os.getenv("PLAYWRIGHT_SLOWMO_MS", "0"))
+
         browser = p.chromium.launch(
-            headless=True,
+            headless=headless,
+            channel=channel,
+            slow_mo=slow_mo,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
             ]
         )
         
@@ -255,6 +308,11 @@ def start_login(
             logger.info(f"Page title: {page.title()}")
             
             _save_debug_artifacts(page, "01_initial")
+
+            if _is_akamai_challenge_page(page):
+                logger.error("Akamai Challenge Validation page detected at initial load")
+                _save_debug_artifacts(page, "akamai_challenge_initial")
+                raise ValueError("AKAMAI_CHALLENGE")
             
             # Check for access denied
             if "Access Denied" in page.content():
@@ -291,11 +349,15 @@ def start_login(
             
             # Click continue
             page.wait_for_timeout(500)
-            submit_btn = page.locator("button[type='submit']").first
-            submit_btn.click()
+            _click_primary_submit(page)
             logger.info("Clicked continue button")
             
             _save_debug_artifacts(page, "02_after_email")
+
+            if _is_akamai_challenge_page(page):
+                logger.error("Akamai Challenge Validation page detected after identity submit")
+                _save_debug_artifacts(page, "akamai_challenge_after_email")
+                raise ValueError("AKAMAI_CHALLENGE")
             
             # --- Step 2: Wait for password page and fill ---
             logger.info("Step 2: Waiting for password input...")
@@ -323,14 +385,24 @@ def start_login(
             
             password_input.fill(password)
             logger.info("Password filled")
+
+            # The submit button can be disabled until input is present.
+            try:
+                expect(page.locator("#form-submit-continue").first).to_be_enabled(timeout=5000)
+            except Exception:
+                pass
             
             # Click login
             page.wait_for_timeout(500)
-            submit_btn = page.locator("button[type='submit']").first
-            submit_btn.click()
+            _click_primary_submit(page)
             logger.info("Clicked login button")
             
             _save_debug_artifacts(page, "03_after_password")
+
+            if _is_akamai_challenge_page(page):
+                logger.error("Akamai Challenge Validation page detected after password submit")
+                _save_debug_artifacts(page, "akamai_challenge_after_password")
+                raise ValueError("AKAMAI_CHALLENGE")
             
             # --- Step 3: Wait for callback or MFA ---
             logger.info("Step 3: Waiting for callback or MFA...")

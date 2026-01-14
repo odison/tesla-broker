@@ -103,6 +103,12 @@ def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(d
         if error_msg == "MFA_REQUIRED":
             logger.info("MFA required, returning MFA_REQUIRED response")
             return MfaRequiredResponse()
+
+        if error_msg == "AKAMAI_CHALLENGE":
+            raise HTTPException(
+                status_code=400,
+                detail="Akamai Challenge triggered (curl/headless likely blocked). Try PLAYWRIGHT_HEADLESS=false on a machine with GUI, or change egress IP.",
+            )
         
         raise HTTPException(status_code=400, detail=error_msg)
     
