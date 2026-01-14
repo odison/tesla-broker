@@ -22,7 +22,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="tesla-broker", version="0.2.0")
+app = FastAPI(
+    title="Tesla Token Broker",
+    version="0.3.0",
+    description="Internal service for Tesla SSO token acquisition using Playwright"
+)
 
 BROKER_SHARED_SECRET = os.getenv("BROKER_SHARED_SECRET")
 
@@ -37,7 +41,7 @@ def _check_secret(x_broker_secret: str | None) -> None:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     logger.info("Health check requested")
-    return {"ok": True}
+    return {"ok": True, "version": "0.3.0", "engine": "playwright"}
 
 
 @app.post(
@@ -47,17 +51,30 @@ def health() -> Dict[str, Any]:
 )
 def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(default=None)):
     """
-    Perform Tesla SSO login using full browser automation.
+    Perform Tesla SSO login using Playwright browser automation.
     
-    This approach lets the browser handle all JS challenges, Captcha, etc.
-    We automate form filling and wait for the callback URL.
+    This approach uses Playwright which has better anti-bot detection bypass.
     
-    If MFA is required and passcode/backup_code is not provided,
-    returns MFA_REQUIRED status. Client should retry with passcode.
+    If MFA is required:
+    - If passcode/backup_code is not provided, returns MFA_REQUIRED status
+    - If passcode/backup_code is provided, attempts to complete MFA
+    
+    Args:
+        email: Tesla account email
+        password: Tesla account password
+        locale: Locale for the login page (default: zh-CN)
+        passcode: MFA passcode from authenticator app (optional)
+        backup_code: MFA backup code (optional)
+    
+    Returns:
+        TokenResponse with access_token, refresh_token, and expires_in
+        OR MfaRequiredResponse if MFA is needed
     """
     logger.info(f"=== Auth start request received ===")
     logger.info(f"Email: {payload.email[:3]}***")
     logger.info(f"Locale: {payload.locale}")
+    logger.info(f"Has passcode: {bool(payload.passcode)}")
+    logger.info(f"Has backup_code: {bool(payload.backup_code)}")
     
     _check_secret(x_broker_secret)
 
@@ -85,11 +102,7 @@ def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(d
         # Special case: MFA required
         if error_msg == "MFA_REQUIRED":
             logger.info("MFA required, returning MFA_REQUIRED response")
-            return MfaRequiredResponse(
-                flow_id="browser-session",
-                transaction_id="browser-session",
-                factors=[],
-            )
+            return MfaRequiredResponse()
         
         raise HTTPException(status_code=400, detail=error_msg)
     
@@ -99,25 +112,3 @@ def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(d
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
-
-
-# Note: In full-browser mode, MFA is handled in a single request by passing
-# passcode/backup_code to /auth/start. The /auth/mfa/verify endpoint is
-# kept for backwards compatibility but simply asks user to retry /auth/start
-# with the passcode included.
-
-@app.post(
-    "/auth/mfa/verify",
-    response_model=TokenResponse,
-    responses={400: {"model": ErrorResponse}},
-)
-def auth_mfa_verify(payload: dict, x_broker_secret: str | None = Header(default=None)):
-    """
-    In full-browser mode, MFA must be handled in a single session.
-    Please retry /auth/start with passcode or backup_code included.
-    """
-    _check_secret(x_broker_secret)
-    raise HTTPException(
-        status_code=400,
-        detail="In browser mode, please include passcode in /auth/start request instead"
-    )

@@ -1,8 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 requests==2.32.3
-selenium==4.27.1
-cachetools==5.5.0
+playwright==1.49.1
 pydantic==2.10.4
 email-validator==2.1.0
-undetected-chromedriver==3.5.5

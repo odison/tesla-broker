@@ -1,9 +1,10 @@
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Install dependencies for Chrome
+# Install dependencies for Playwright
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        wget \
@@ -27,18 +28,16 @@ RUN apt-get update \
        libxkbcommon0 \
        libxrandr2 \
        xdg-utils \
-       chromium \
-       chromium-driver \
     && rm -rf /var/lib/apt/lists/*
-
-# Let selenium/undetected-chromedriver find chromium
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Install Playwright browsers (Chromium only to save space)
+RUN playwright install chromium
+RUN playwright install-deps chromium
 
 COPY app /app/app
 
