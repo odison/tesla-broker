@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -28,14 +29,24 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# Setup logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 # Configuration
 MAX_WAIT_SECONDS = int(os.getenv("TESLA_MAX_WAIT_SECONDS", "60"))
 POLL_INTERVAL = float(os.getenv("TESLA_POLL_INTERVAL", "0.5"))
 
 CLIENT_ID = os.getenv("TESLA_CLIENT_ID", "ownerapi")
-AUTH_URL = os.getenv("TESLA_AUTHORIZE_URL", "https://auth.tesla.com/oauth2/v3/authorize")
-TOKEN_URL = os.getenv("TESLA_TOKEN_URL", "https://auth.tesla.com/oauth2/v3/token")
-TOKEN_URL_CN = os.getenv("TESLA_TOKEN_URL_CN", "https://auth.tesla.cn/oauth2/v3/token")
+# Tesla China uses auth.tesla.cn
+AUTH_URL = os.getenv("TESLA_AUTHORIZE_URL", "https://auth.tesla.cn/oauth2/v3/authorize")
+AUTH_URL_US = os.getenv("TESLA_AUTHORIZE_URL_US", "https://auth.tesla.com/oauth2/v3/authorize")
+TOKEN_URL = os.getenv("TESLA_TOKEN_URL", "https://auth.tesla.cn/oauth2/v3/token")
+TOKEN_URL_US = os.getenv("TESLA_TOKEN_URL_US", "https://auth.tesla.com/oauth2/v3/token")
 REDIRECT_URI = os.getenv("TESLA_REDIRECT_URI", "https://auth.tesla.com/void/callback")
 
 # Scopes
@@ -44,6 +55,7 @@ SCOPES = "openid email offline_access"
 
 def _generate_pkce() -> tuple[str, str, str]:
     """Generate PKCE code_verifier, code_challenge, and state."""
+    logger.info("Generating PKCE parameters...")
     verifier_bytes = os.urandom(32)
     code_verifier = base64.urlsafe_b64encode(verifier_bytes).rstrip(b"=").decode("utf-8")
     
@@ -52,6 +64,7 @@ def _generate_pkce() -> tuple[str, str, str]:
     
     state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode("utf-8")
     
+    logger.debug(f"PKCE state: {state}")
     return code_verifier, code_challenge, state
 
 
@@ -68,7 +81,10 @@ def _build_authorize_url(code_challenge: str, state: str, locale: str = "zh-CN")
         "locale": locale,
         "prompt": "login",
     }
-    return f"{AUTH_URL}?{urlencode(params)}"
+    url = f"{AUTH_URL}?{urlencode(params)}"
+    logger.info(f"Built authorize URL with locale={locale}")
+    logger.debug(f"Authorize URL: {url[:100]}...")
+    return url
 
 
 def _create_driver() -> webdriver.Chrome:
@@ -91,12 +107,35 @@ def _create_driver() -> webdriver.Chrome:
     if chrome_bin:
         options.binary_location = chrome_bin
     
+    logger.info("Creating Chrome driver...")
     driver = webdriver.Chrome(options=options)
     
     # Remove webdriver property to avoid detection
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     
+    logger.info("Chrome driver created successfully")
     return driver
+
+
+def _save_debug_screenshot(driver: webdriver.Chrome, name: str) -> None:
+    """Save a screenshot for debugging."""
+    try:
+        path = f"/tmp/{name}.png"
+        driver.save_screenshot(path)
+        logger.info(f"Screenshot saved to {path}")
+    except Exception as e:
+        logger.warning(f"Failed to save screenshot: {e}")
+
+
+def _save_debug_html(driver: webdriver.Chrome, name: str) -> None:
+    """Save page HTML for debugging."""
+    try:
+        path = f"/tmp/{name}.html"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        logger.info(f"HTML saved to {path}")
+    except Exception as e:
+        logger.warning(f"Failed to save HTML: {e}")
 
 
 def _is_callback_url(url: str) -> bool:
@@ -178,16 +217,25 @@ def _element_exists(driver: webdriver.Chrome, by: By, value: str) -> bool:
 
 def _find_and_fill_input(driver: webdriver.Chrome, selectors: list[str], value: str, timeout: int = 15) -> None:
     """Find an input using multiple possible selectors and fill it."""
+    logger.debug(f"Looking for input with selectors: {selectors}")
     input_el = None
     for selector in selectors:
         try:
-            input_el = _wait_for_element(driver, By.CSS_SELECTOR, selector, timeout=timeout)
+            logger.debug(f"Trying selector: {selector}")
+            input_el = _wait_for_element(driver, By.CSS_SELECTOR, selector, timeout=3)
             if input_el:
+                logger.info(f"Found input with selector: {selector}")
                 break
         except TimeoutException:
+            logger.debug(f"Selector not found: {selector}")
             continue
     
     if not input_el:
+        # Save debug info before raising error
+        _save_debug_screenshot(driver, "input_not_found")
+        _save_debug_html(driver, "input_not_found")
+        logger.error(f"Current URL: {driver.current_url}")
+        logger.error(f"Page title: {driver.title}")
         raise ValueError(f"Could not find input with selectors: {selectors}")
     
     input_el.clear()
@@ -289,6 +337,9 @@ def start_login(
     This approach lets the browser handle all JS challenges, Captcha, etc.
     We just automate form filling and wait for the callback URL.
     """
+    logger.info(f"=== Starting Tesla SSO login for {email[:3]}***@*** ===")
+    logger.info(f"Locale: {locale}")
+    
     # Generate PKCE parameters
     code_verifier, code_challenge, state = _generate_pkce()
     
@@ -299,38 +350,60 @@ def start_login(
     
     try:
         # Navigate to authorize URL
+        logger.info(f"Navigating to authorize URL...")
         driver.get(authorize_url)
         
         # Wait for page to load
+        logger.info("Waiting for page to load (3s)...")
         time.sleep(3)
         
+        logger.info(f"Page loaded. Current URL: {driver.current_url}")
+        logger.info(f"Page title: {driver.title}")
+        
+        # Save initial page state for debugging
+        _save_debug_screenshot(driver, "01_initial_page")
+        _save_debug_html(driver, "01_initial_page")
+        
         # --- Step 1: Fill email (identity) ---
+        logger.info("Step 1: Looking for email input field...")
         email_selectors = [
             "input#form-input-identity",
             "input[name='identity']",
             "input[type='email']",
             "input#identity",
+            "input[autocomplete='username']",
+            "input[autocomplete='email']",
         ]
         _find_and_fill_input(driver, email_selectors, email)
+        logger.info("Email filled successfully")
         
         # Small delay before clicking
         time.sleep(0.5)
         
         # Click continue button
+        logger.info("Looking for submit button...")
         button_selectors = [
             "button[type='submit']",
             "button#form-submit-continue",
             "button.tds-btn--primary",
             "button.tds-btn",
+            "input[type='submit']",
         ]
         _find_and_click_button(driver, button_selectors)
+        logger.info("Submit button clicked")
+        
+        _save_debug_screenshot(driver, "02_after_email_submit")
         
         # --- Step 2: Wait for password page and fill password ---
+        logger.info("Step 2: Waiting for password page...")
         if not _wait_for_page_transition(driver, _is_password_page, timeout=15):
             # Maybe it's a combined form, check if password field exists
             if not _is_password_page(driver):
+                _save_debug_screenshot(driver, "02_no_password_field")
+                _save_debug_html(driver, "02_no_password_field")
                 raise ValueError("Could not find password input after submitting email")
         
+        logger.info("Password page found")
         time.sleep(1)
         
         password_selectors = [
@@ -339,13 +412,19 @@ def start_login(
             "input[name='credential']",
         ]
         _find_and_fill_input(driver, password_selectors, password)
+        logger.info("Password filled successfully")
         
         time.sleep(0.5)
         
         # Click submit button
+        logger.info("Clicking login button...")
         _find_and_click_button(driver, button_selectors)
+        logger.info("Login button clicked")
+        
+        _save_debug_screenshot(driver, "03_after_password_submit")
         
         # --- Step 3: Wait for callback or MFA ---
+        logger.info("Step 3: Waiting for callback or MFA page...")
         start_time = time.time()
         mfa_required = False
         
@@ -354,10 +433,12 @@ def start_login(
             
             # Check if we hit the callback
             if _is_callback_url(current_url):
+                logger.info("Callback URL detected!")
                 break
             
             # Check for MFA
             if _is_mfa_page(driver):
+                logger.info("MFA page detected")
                 mfa_required = True
                 break
             
@@ -371,18 +452,20 @@ def start_login(
         else:
             if not _is_callback_url(driver.current_url) and not mfa_required:
                 # Save screenshot for debugging
-                try:
-                    driver.save_screenshot("/tmp/tesla_timeout.png")
-                except Exception:
-                    pass
+                _save_debug_screenshot(driver, "04_timeout")
+                _save_debug_html(driver, "04_timeout")
+                logger.error(f"Timeout! Current URL: {driver.current_url}")
                 raise TimeoutException(f"Timed out waiting for callback after {MAX_WAIT_SECONDS}s")
         
         # --- Step 4: Handle MFA if required ---
         if mfa_required:
+            logger.info("Step 4: Handling MFA...")
             if not passcode and not backup_code:
+                logger.warning("MFA required but no passcode provided")
                 raise ValueError("MFA_REQUIRED")
             
             mfa_code = passcode or backup_code
+            logger.info("Entering MFA code...")
             
             passcode_selectors = [
                 "input#form-input-passcode",
@@ -396,29 +479,39 @@ def start_login(
             
             # Click submit
             _find_and_click_button(driver, button_selectors)
+            logger.info("MFA submitted, waiting for callback...")
             
             # Wait for callback after MFA
             start_time = time.time()
             while time.time() - start_time < MAX_WAIT_SECONDS:
                 if _is_callback_url(driver.current_url):
+                    logger.info("Callback URL detected after MFA!")
                     break
                 _check_for_error(driver)
                 time.sleep(POLL_INTERVAL)
             else:
+                _save_debug_screenshot(driver, "05_mfa_timeout")
                 raise TimeoutException("Timed out waiting for callback after MFA")
         
         # --- Step 5: Extract code from callback URL ---
+        logger.info("Step 5: Extracting authorization code from callback URL...")
         callback_url = driver.current_url
+        logger.debug(f"Callback URL: {callback_url}")
         code, returned_state, issuer = _extract_code_from_url(callback_url)
+        logger.info(f"Authorization code obtained (issuer: {issuer})")
         
         # Verify state
         if returned_state and returned_state != state:
             raise ValueError("CSRF state mismatch")
         
         # --- Step 6: Exchange code for tokens ---
+        logger.info("Step 6: Exchanging code for tokens...")
         access_token, refresh_token, expires_in = _exchange_code_for_token(
             code, code_verifier, issuer
         )
+        
+        logger.info("=== Login successful! ===")
+        logger.info(f"Token expires in: {expires_in}s")
         
         return LoginResult(
             access_token=access_token,
@@ -427,6 +520,7 @@ def start_login(
         )
     
     finally:
+        logger.info("Closing browser...")
         driver.quit()
 
 

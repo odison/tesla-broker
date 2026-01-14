@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict
 
@@ -12,6 +13,14 @@ from .models import (
     TokenResponse,
 )
 from .tesla_sso import LoginResult, start_login
+
+# Setup logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="tesla-broker", version="0.2.0")
 
@@ -27,6 +36,7 @@ def _check_secret(x_broker_secret: str | None) -> None:
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
+    logger.info("Health check requested")
     return {"ok": True}
 
 
@@ -45,9 +55,14 @@ def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(d
     If MFA is required and passcode/backup_code is not provided,
     returns MFA_REQUIRED status. Client should retry with passcode.
     """
+    logger.info(f"=== Auth start request received ===")
+    logger.info(f"Email: {payload.email[:3]}***")
+    logger.info(f"Locale: {payload.locale}")
+    
     _check_secret(x_broker_secret)
 
     try:
+        logger.info("Calling start_login...")
         result: LoginResult = start_login(
             payload.email,
             payload.password,
@@ -56,6 +71,7 @@ def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(d
             backup_code=payload.backup_code,
         )
 
+        logger.info("Login successful, returning tokens")
         return TokenResponse(
             access_token=result.access_token,
             refresh_token=result.refresh_token,
@@ -64,9 +80,11 @@ def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(d
 
     except ValueError as e:
         error_msg = str(e)
+        logger.warning(f"ValueError: {error_msg}")
         
         # Special case: MFA required
         if error_msg == "MFA_REQUIRED":
+            logger.info("MFA required, returning MFA_REQUIRED response")
             return MfaRequiredResponse(
                 flow_id="browser-session",
                 transaction_id="browser-session",
@@ -79,6 +97,7 @@ def auth_start(payload: StartAuthRequest, x_broker_secret: str | None = Header(d
         raise
     
     except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 
