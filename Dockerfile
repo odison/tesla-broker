@@ -8,7 +8,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        wget \
-       gnupg \
        ca-certificates \
        fonts-liberation \
        libasound2 \
