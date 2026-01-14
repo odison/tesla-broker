@@ -11,7 +11,7 @@ class StartAuthRequest(BaseModel):
     device: str = Field(default="1", pattern="^[12]$")
     locale: str = Field(default="zh-CN")
 
-    # Optional: let client do MFA in one shot
+    # MFA codes - in browser mode, include these if MFA is required
     passcode: Optional[str] = None
     backup_code: Optional[str] = None
 

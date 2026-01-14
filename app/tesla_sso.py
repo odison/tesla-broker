@@ -1,305 +1,446 @@
+"""
+Tesla SSO automation using full browser approach.
+
+Inspired by https://github.com/adriankumpf/tesla_auth
+
+Instead of mixing requests + Selenium with HTML parsing,
+we let the browser handle everything (JS challenges, Captcha, etc.)
+and just automate form filling + monitor URL for the callback.
+"""
+
 from __future__ import annotations
 
 import base64
 import hashlib
 import os
-import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from typing import Optional
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from selenium import webdriver
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-MAX_ATTEMPTS = int(os.getenv("TESLA_MAX_ATTEMPTS", "7"))
+# Configuration
+MAX_WAIT_SECONDS = int(os.getenv("TESLA_MAX_WAIT_SECONDS", "60"))
+POLL_INTERVAL = float(os.getenv("TESLA_POLL_INTERVAL", "0.5"))
 
-UA = os.getenv("TESLA_UA", "UA")
-X_TESLA_USER_AGENT = os.getenv("TESLA_X_TESLA_USER_AGENT", "UA")
-
-AUTHORIZE_URL = os.getenv("TESLA_AUTHORIZE_URL", "https://auth.tesla.cn/oauth2/v3/authorize")
-TOKEN_URL = os.getenv("TESLA_TOKEN_URL", "https://auth.tesla.cn/oauth2/v3/token")
-REDIRECT_URI = os.getenv("TESLA_REDIRECT_URI", "https://auth.tesla.com/void/callback")
 CLIENT_ID = os.getenv("TESLA_CLIENT_ID", "ownerapi")
+AUTH_URL = os.getenv("TESLA_AUTHORIZE_URL", "https://auth.tesla.com/oauth2/v3/authorize")
+TOKEN_URL = os.getenv("TESLA_TOKEN_URL", "https://auth.tesla.com/oauth2/v3/token")
+TOKEN_URL_CN = os.getenv("TESLA_TOKEN_URL_CN", "https://auth.tesla.cn/oauth2/v3/token")
+REDIRECT_URI = os.getenv("TESLA_REDIRECT_URI", "https://auth.tesla.com/void/callback")
+
+# Scopes
+SCOPES = "openid email offline_access"
 
 
-def gen_params() -> tuple[bytes, bytes, str]:
-    verifier_bytes = os.urandom(86)
-    code_verifier = base64.urlsafe_b64encode(verifier_bytes).rstrip(b"=")
-    code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier).digest()).rstrip(b"=")
+def _generate_pkce() -> tuple[str, str, str]:
+    """Generate PKCE code_verifier, code_challenge, and state."""
+    verifier_bytes = os.urandom(32)
+    code_verifier = base64.urlsafe_b64encode(verifier_bytes).rstrip(b"=").decode("utf-8")
+    
+    challenge_bytes = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    code_challenge = base64.urlsafe_b64encode(challenge_bytes).rstrip(b"=").decode("utf-8")
+    
     state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode("utf-8")
+    
     return code_verifier, code_challenge, state
 
 
-def create_driver() -> webdriver.Chrome:
-    options = webdriver.ChromeOptions()
+def _build_authorize_url(code_challenge: str, state: str, locale: str = "zh-CN") -> str:
+    """Build the Tesla OAuth2 authorize URL."""
+    params = {
+        "client_id": CLIENT_ID,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": SCOPES,
+        "state": state,
+        "locale": locale,
+        "prompt": "login",
+    }
+    return f"{AUTH_URL}?{urlencode(params)}"
 
-    # Docker/headless defaults
+
+def _create_driver() -> webdriver.Chrome:
+    """Create a headless Chrome driver."""
+    options = webdriver.ChromeOptions()
+    
+    # Headless mode
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-
+    options.add_argument("--window-size=1920,1080")
+    
+    # Avoid detection
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    
     chrome_bin = os.getenv("CHROME_BIN")
     if chrome_bin:
         options.binary_location = chrome_bin
-
+    
     driver = webdriver.Chrome(options=options)
-    try:
-        driver.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": UA})
-    except Exception:
-        # Not fatal; some drivers may not support CDP.
-        pass
+    
+    # Remove webdriver property to avoid detection
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    
     return driver
 
 
-@dataclass
-class StartResult:
-    status: str
-    session: requests.Session
-    params: list[tuple[str, str]]
-    code_verifier: str
-    transaction_id: str
+def _is_callback_url(url: str) -> bool:
+    """Check if the URL is the OAuth callback URL."""
+    return url.startswith(REDIRECT_URI)
 
 
-def _initial_headers() -> Dict[str, str]:
-    # Note: Tesla may trigger JS challenge if UA looks browser-like.
-    # Keep this configurable; current default is a mobile UA for compatibility.
-    return {
-        "User-Agent": os.getenv(
-            "TESLA_IDP_UA",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-        ),
+def _extract_code_from_url(url: str) -> tuple[str, str, Optional[str]]:
+    """Extract code, state, and issuer from callback URL."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    
+    if "error" in params:
+        error = params["error"][0]
+        if error == "login_cancelled":
+            raise ValueError("Login was cancelled by user")
+        raise ValueError(f"OAuth error: {error}")
+    
+    if "code" not in params:
+        raise ValueError("No authorization code in callback URL")
+    
+    code = params["code"][0]
+    state = params.get("state", [""])[0]
+    issuer = params.get("issuer", [None])[0]
+    
+    return code, state, issuer
+
+
+def _exchange_code_for_token(code: str, code_verifier: str, issuer: Optional[str] = None) -> tuple[str, str, int]:
+    """Exchange authorization code for access/refresh tokens."""
+    # Use CN token URL if issuer is from China
+    if issuer and "tesla.cn" in issuer:
+        token_url = TOKEN_URL_CN
+    else:
+        token_url = TOKEN_URL
+    
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "code": code,
+        "code_verifier": code_verifier,
+        "redirect_uri": REDIRECT_URI,
     }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    
+    resp = requests.post(token_url, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    
+    data = resp.json()
+    return data["access_token"], data["refresh_token"], data.get("expires_in", 0)
 
 
-class NeedsBrowserFallback(Exception):
-    """Raised when HTML doesn't contain expected fields and we need Selenium."""
-    pass
+@dataclass
+class LoginResult:
+    access_token: str
+    refresh_token: str
+    expires_in: int
 
 
-def _extract_csrf_and_txid_from_html(html: str) -> tuple[str, str]:
-    csrf_match = re.search(r'name="_csrf".+?value="([^"]+)"', html, re.DOTALL)
-    txid_match = re.search(r'name="transaction_id".+?value="([^"]+)"', html, re.DOTALL)
-    if not csrf_match or not txid_match:
-        raise NeedsBrowserFallback("Could not extract csrf/transaction_id from HTML")
-    return csrf_match.group(1), txid_match.group(1)
+def _wait_for_element(driver: webdriver.Chrome, by: By, value: str, timeout: int = 10):
+    """Wait for an element to be present and visible."""
+    return WebDriverWait(driver, timeout).until(
+        EC.visibility_of_element_located((by, value))
+    )
 
 
-def _extract_csrf_and_txid_via_browser(url: str) -> tuple[str, str, Dict[str, str]]:
-    driver = create_driver()
+def _element_exists(driver: webdriver.Chrome, by: By, value: str) -> bool:
+    """Check if an element exists on the page."""
     try:
-        driver.get(url)
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[name=identity]")))
+        driver.find_element(by, value)
+        return True
+    except NoSuchElementException:
+        return False
 
-        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
-        csrf = driver.find_element(By.CSS_SELECTOR, "input[name=_csrf]").get_attribute("value")
-        transaction_id = driver.find_element(By.CSS_SELECTOR, "input[name=transaction_id]").get_attribute("value")
-        return csrf, transaction_id, cookies
+
+def _find_and_fill_input(driver: webdriver.Chrome, selectors: list[str], value: str, timeout: int = 15) -> None:
+    """Find an input using multiple possible selectors and fill it."""
+    input_el = None
+    for selector in selectors:
+        try:
+            input_el = _wait_for_element(driver, By.CSS_SELECTOR, selector, timeout=timeout)
+            if input_el:
+                break
+        except TimeoutException:
+            continue
+    
+    if not input_el:
+        raise ValueError(f"Could not find input with selectors: {selectors}")
+    
+    input_el.clear()
+    input_el.send_keys(value)
+
+
+def _find_and_click_button(driver: webdriver.Chrome, selectors: list[str]) -> None:
+    """Find a button using multiple possible selectors and click it."""
+    for selector in selectors:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, selector)
+            if btn.is_displayed() and btn.is_enabled():
+                btn.click()
+                return
+        except NoSuchElementException:
+            continue
+    
+    raise ValueError(f"Could not find clickable button with selectors: {selectors}")
+
+
+def _check_for_error(driver: webdriver.Chrome) -> None:
+    """Check if there's an error message on the page."""
+    error_selectors = [
+        ".error-message",
+        ".tds-form-feedback--error",
+        "[data-testid='error-message']",
+        ".form-error",
+        ".tds-form-input-error",
+    ]
+    
+    for selector in error_selectors:
+        try:
+            error_el = driver.find_element(By.CSS_SELECTOR, selector)
+            if error_el.is_displayed():
+                error_text = error_el.text.strip()
+                if error_text:
+                    if "credentials" in error_text.lower() or "password" in error_text.lower():
+                        raise ValueError("Invalid credentials")
+                    if "could not sign you in" in error_text.lower():
+                        raise ValueError("Invalid credentials")
+                    raise ValueError(f"Login error: {error_text}")
+        except NoSuchElementException:
+            continue
+
+
+def _is_mfa_page(driver: webdriver.Chrome) -> bool:
+    """Check if we're on the MFA verification page."""
+    mfa_indicators = [
+        "input#form-input-passcode",
+        "[data-testid='passcode-input']",
+        "input[name='passcode']",
+        "input[id*='passcode']",
+    ]
+    
+    for selector in mfa_indicators:
+        if _element_exists(driver, By.CSS_SELECTOR, selector):
+            return True
+    
+    # Also check URL
+    return "/mfa" in driver.current_url
+
+
+def _is_password_page(driver: webdriver.Chrome) -> bool:
+    """Check if we're on the password input page."""
+    password_selectors = [
+        "input#form-input-credential",
+        "input[type='password']",
+        "input[name='credential']",
+    ]
+    
+    for selector in password_selectors:
+        if _element_exists(driver, By.CSS_SELECTOR, selector):
+            return True
+    
+    return False
+
+
+def _wait_for_page_transition(driver: webdriver.Chrome, check_func, timeout: int = 15) -> bool:
+    """Wait for a page transition to complete."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if check_func(driver):
+            return True
+        time.sleep(POLL_INTERVAL)
+    return False
+
+
+def start_login(
+    email: str,
+    password: str,
+    *,
+    locale: str = "zh-CN",
+    passcode: Optional[str] = None,
+    backup_code: Optional[str] = None,
+) -> LoginResult:
+    """
+    Perform Tesla SSO login using browser automation.
+    
+    This approach lets the browser handle all JS challenges, Captcha, etc.
+    We just automate form filling and wait for the callback URL.
+    """
+    # Generate PKCE parameters
+    code_verifier, code_challenge, state = _generate_pkce()
+    
+    # Build authorize URL
+    authorize_url = _build_authorize_url(code_challenge, state, locale)
+    
+    driver = _create_driver()
+    
+    try:
+        # Navigate to authorize URL
+        driver.get(authorize_url)
+        
+        # Wait for page to load
+        time.sleep(3)
+        
+        # --- Step 1: Fill email (identity) ---
+        email_selectors = [
+            "input#form-input-identity",
+            "input[name='identity']",
+            "input[type='email']",
+            "input#identity",
+        ]
+        _find_and_fill_input(driver, email_selectors, email)
+        
+        # Small delay before clicking
+        time.sleep(0.5)
+        
+        # Click continue button
+        button_selectors = [
+            "button[type='submit']",
+            "button#form-submit-continue",
+            "button.tds-btn--primary",
+            "button.tds-btn",
+        ]
+        _find_and_click_button(driver, button_selectors)
+        
+        # --- Step 2: Wait for password page and fill password ---
+        if not _wait_for_page_transition(driver, _is_password_page, timeout=15):
+            # Maybe it's a combined form, check if password field exists
+            if not _is_password_page(driver):
+                raise ValueError("Could not find password input after submitting email")
+        
+        time.sleep(1)
+        
+        password_selectors = [
+            "input#form-input-credential",
+            "input[type='password']",
+            "input[name='credential']",
+        ]
+        _find_and_fill_input(driver, password_selectors, password)
+        
+        time.sleep(0.5)
+        
+        # Click submit button
+        _find_and_click_button(driver, button_selectors)
+        
+        # --- Step 3: Wait for callback or MFA ---
+        start_time = time.time()
+        mfa_required = False
+        
+        while time.time() - start_time < MAX_WAIT_SECONDS:
+            current_url = driver.current_url
+            
+            # Check if we hit the callback
+            if _is_callback_url(current_url):
+                break
+            
+            # Check for MFA
+            if _is_mfa_page(driver):
+                mfa_required = True
+                break
+            
+            # Check for errors
+            try:
+                _check_for_error(driver)
+            except ValueError:
+                raise
+            
+            time.sleep(POLL_INTERVAL)
+        else:
+            if not _is_callback_url(driver.current_url) and not mfa_required:
+                # Save screenshot for debugging
+                try:
+                    driver.save_screenshot("/tmp/tesla_timeout.png")
+                except Exception:
+                    pass
+                raise TimeoutException(f"Timed out waiting for callback after {MAX_WAIT_SECONDS}s")
+        
+        # --- Step 4: Handle MFA if required ---
+        if mfa_required:
+            if not passcode and not backup_code:
+                raise ValueError("MFA_REQUIRED")
+            
+            mfa_code = passcode or backup_code
+            
+            passcode_selectors = [
+                "input#form-input-passcode",
+                "[data-testid='passcode-input']",
+                "input[name='passcode']",
+                "input[id*='passcode']",
+            ]
+            _find_and_fill_input(driver, passcode_selectors, mfa_code, timeout=10)
+            
+            time.sleep(0.5)
+            
+            # Click submit
+            _find_and_click_button(driver, button_selectors)
+            
+            # Wait for callback after MFA
+            start_time = time.time()
+            while time.time() - start_time < MAX_WAIT_SECONDS:
+                if _is_callback_url(driver.current_url):
+                    break
+                _check_for_error(driver)
+                time.sleep(POLL_INTERVAL)
+            else:
+                raise TimeoutException("Timed out waiting for callback after MFA")
+        
+        # --- Step 5: Extract code from callback URL ---
+        callback_url = driver.current_url
+        code, returned_state, issuer = _extract_code_from_url(callback_url)
+        
+        # Verify state
+        if returned_state and returned_state != state:
+            raise ValueError("CSRF state mismatch")
+        
+        # --- Step 6: Exchange code for tokens ---
+        access_token, refresh_token, expires_in = _exchange_code_for_token(
+            code, code_verifier, issuer
+        )
+        
+        return LoginResult(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=expires_in,
+        )
+    
     finally:
         driver.quit()
 
 
-def _session_from_cookies(cookies: Dict[str, str]) -> requests.Session:
-    s = requests.Session()
-    for k, v in cookies.items():
-        s.cookies.set(k, v)
-    return s
+# Compatibility stubs for main.py
+def get_mfa_factors(session, transaction_id: str) -> list[dict]:
+    """Get MFA factors - not used in browser approach, kept for compatibility."""
+    return []
 
 
-def start_login(email: str, password: str, *, locale: str = "zh-CN") -> StartResult:
-    headers = _initial_headers()
-
-    code_verifier_b, code_challenge, state = gen_params()
-    params: list[tuple[str, str]] = [
-        ("client_id", CLIENT_ID),
-        ("code_challenge", code_challenge.decode("utf-8")),
-        ("code_challenge_method", "S256"),
-        ("locale", locale),
-        ("prompt", "login"),
-        ("redirect_uri", REDIRECT_URI),
-        ("response_type", "code"),
-        ("scope", "openid email offline_access"),
-        ("state", state),
-    ]
-
-    session = requests.Session()
-    resp = session.get(AUTHORIZE_URL, headers=headers, params=params)
-
-    # Try HTML extraction first; fallback to browser if it fails
-    try:
-        if "<title>" in resp.text:
-            csrf, transaction_id = _extract_csrf_and_txid_from_html(resp.text)
-        else:
-            raise NeedsBrowserFallback("No <title> in response")
-    except NeedsBrowserFallback:
-        csrf, transaction_id, driver_cookies = _extract_csrf_and_txid_via_browser(resp.request.url)
-        for k, v in driver_cookies.items():
-            session.cookies.set(k, v)
-    else:
-        pass  # csrf/transaction_id already set
-
-    # identity phase
-    data = {
-        "_csrf": csrf,
-        "_phase": "identity",
-        "transaction_id": transaction_id,
-        "cancel": "",
-        "identity": email,
-    }
-
-    resp = session.post(
-        AUTHORIZE_URL,
-        headers=headers,
-        params=params,
-        data=data,
-        allow_redirects=False,
-    )
-
-    # Try HTML extraction first; fallback to browser if it fails
-    try:
-        if "<title>" in resp.text:
-            csrf, transaction_id = _extract_csrf_and_txid_from_html(resp.text)
-        else:
-            raise NeedsBrowserFallback("No <title> in response after identity phase")
-    except NeedsBrowserFallback:
-        csrf, transaction_id, driver_cookies = _extract_csrf_and_txid_via_browser(resp.request.url)
-        for k, v in driver_cookies.items():
-            session.cookies.set(k, v)
-
-    # authenticate phase
-    data = {
-        "_csrf": csrf,
-        "_phase": "authenticate",
-        "_process": "1",
-        "transaction_id": transaction_id,
-        "cancel": "",
-        "identity": email,
-        "credential": password,
-        "privacy_consent": 1,
-    }
-
-    resp = None
-    for attempt in range(MAX_ATTEMPTS):
-        resp = session.post(
-            AUTHORIZE_URL,
-            headers=headers,
-            params=params,
-            data=data,
-            allow_redirects=False,
-        )
-
-        if resp.status_code == 401 and "We could not sign you in" in resp.text:
-            raise ValueError("Invalid credentials")
-
-        if resp.ok and (resp.status_code == 302 or "<title>" in resp.text):
-            break
-        if resp.ok and resp.status_code == 200 and "/mfa/verify" in resp.text:
-            break
-
-        time.sleep(3)
-
-    if resp is None:
-        raise RuntimeError("No response from Tesla")
-
-    is_mfa = bool(resp.status_code == 200 and "/mfa/verify" in resp.text)
-    code_verifier = code_verifier_b.decode("utf-8")
-
-    return StartResult(
-        status="MFA_REQUIRED" if is_mfa else "OK",
-        session=session,
-        params=params,
-        code_verifier=code_verifier,
-        transaction_id=transaction_id,
-    )
+def verify_mfa(*args, **kwargs) -> None:
+    """Verify MFA - not used in browser approach, kept for compatibility."""
+    pass
 
 
-def get_mfa_factors(session: requests.Session, transaction_id: str) -> list[dict[str, Any]]:
-    headers = _initial_headers()
-    resp = session.get(
-        f"{AUTHORIZE_URL}/mfa/factors?transaction_id={transaction_id}",
-        headers=headers,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("data", [])
-
-
-def verify_mfa(
-    session: requests.Session,
-    *,
-    transaction_id: str,
-    factor_id: Optional[str],
-    passcode: Optional[str],
-    backup_code: Optional[str],
-) -> None:
-    headers = _initial_headers()
-
-    if passcode:
-        if not factor_id:
-            raise ValueError("factor_id is required when using passcode")
-        payload = {"transaction_id": transaction_id, "factor_id": factor_id, "passcode": passcode}
-        resp = session.post(f"{AUTHORIZE_URL}/mfa/verify", headers=headers, json=payload)
-        resp.raise_for_status()
-        body = resp.json().get("data", {})
-        if not body.get("approved") or not body.get("valid"):
-            raise ValueError("Invalid passcode")
-        return
-
-    if backup_code:
-        payload = {"transaction_id": transaction_id, "backup_code": backup_code}
-        resp = session.post(f"{AUTHORIZE_URL}/mfa/backupcodes/attempt", headers=headers, json=payload)
-        resp.raise_for_status()
-        body = resp.json().get("data", {})
-        if not body.get("valid"):
-            raise ValueError("Invalid backup code")
-        return
-
-    raise ValueError("Either passcode or backup_code is required")
-
-
-def finish_and_exchange_token(
-    session: requests.Session,
-    *,
-    params: list[tuple[str, str]],
-    code_verifier: str,
-    transaction_id: str,
-) -> tuple[str, str]:
-    headers = _initial_headers()
-
-    # Ask authorize endpoint to redirect with code
-    data = {"transaction_id": transaction_id}
-    resp = None
-    for _ in range(MAX_ATTEMPTS):
-        resp = session.post(AUTHORIZE_URL, headers=headers, params=params, data=data, allow_redirects=False)
-        if resp.headers.get("location"):
-            break
-        time.sleep(1)
-
-    if resp is None or not resp.headers.get("location"):
-        raise ValueError("Did not receive redirect location")
-
-    location = resp.headers["location"]
-    parsed = urlparse(location)
-    q = parse_qs(parsed.query)
-    if "code" not in q or not q["code"]:
-        raise ValueError("Missing authorization code")
-
-    code = q["code"][0]
-
-    token_headers = {"user-agent": UA, "x-tesla-user-agent": X_TESLA_USER_AGENT}
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": CLIENT_ID,
-        "code_verifier": code_verifier,
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-    }
-
-    token_resp = session.post(TOKEN_URL, headers=token_headers, json=payload)
-    token_resp.raise_for_status()
-    body = token_resp.json()
-    return body["access_token"], body["refresh_token"]
+def finish_and_exchange_token(*args, **kwargs) -> tuple[str, str]:
+    """Not used in browser approach, kept for compatibility."""
+    raise NotImplementedError("Use start_login() instead")

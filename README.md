@@ -1,13 +1,15 @@
 # tesla-broker (internal)
 
-Internal HTTP service that wraps Tesla SSO login/token exchange.
+Internal HTTP service that wraps Tesla SSO login/token exchange using **full browser automation**.
+
+Inspired by [tesla_auth](https://github.com/adriankumpf/tesla_auth) - the browser handles all JS challenges, Captcha, etc. We just automate form filling and wait for the OAuth callback.
 
 ## Run (Docker)
 
 From this folder:
 
 - `docker compose up --build`
-- Health check: `curl http://127.0.0.1:8080/health`
+- Health check: `curl http://127.0.0.1:18080/health`
 
 ## API
 
@@ -28,27 +30,37 @@ Response:
 - Success:
 
 ```json
-{ "access_token": "...", "refresh_token": "...", "token_type": "Bearer" }
+{ "access_token": "...", "refresh_token": "...", "token_type": "Bearer", "expires_in": 28800 }
 ```
 
-- MFA required:
+- MFA required (no passcode provided):
 
 ```json
-{ "status": "MFA_REQUIRED", "flow_id": "...", "transaction_id": "...", "factors": [ {"id":"...","name":"Device #1"} ] }
+{ "status": "MFA_REQUIRED", "flow_id": "browser-session", "transaction_id": "browser-session", "factors": [] }
 ```
 
-### POST /auth/mfa/verify
+### Handling MFA
 
-Request JSON:
+In browser mode, MFA is handled in a single request. If you get `MFA_REQUIRED`, retry `/auth/start` with the passcode included:
 
 ```json
-{ "flow_id": "...", "factor_id": "...", "passcode": "123456" }
+{
+  "email": "user@example.com",
+  "password": "...",
+  "locale": "zh-CN",
+  "passcode": "123456"
+}
 ```
 
-Response:
+Or with backup code:
 
 ```json
-{ "access_token": "...", "refresh_token": "...", "token_type": "Bearer" }
+{
+  "email": "user@example.com",
+  "password": "...",
+  "locale": "zh-CN",
+  "backup_code": "ABCD-1234-EFGH"
+}
 ```
 
 ## Security
@@ -56,3 +68,13 @@ Response:
 - Run on internal network only.
 - Optionally set `BROKER_SHARED_SECRET` and send header `X-Broker-Secret` from Laravel.
 - Do not log request bodies.
+
+## How it works
+
+1. Opens headless Chrome and navigates to Tesla OAuth authorize URL
+2. Automatically fills email, clicks continue
+3. Fills password, submits
+4. Waits for redirect to `https://auth.tesla.com/void/callback?code=xxx`
+5. Extracts `code` from URL and exchanges it for tokens via standard OAuth2
+
+This approach avoids parsing HTML/CSRF tokens and lets the real browser handle all JavaScript challenges.
