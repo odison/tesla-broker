@@ -4,7 +4,7 @@ services:
       context: .
     image: tesla-broker:local
     ports:
-      - "8080:8080"
+      - "18080:8080"
     environment:
       # If set, broker requires X-Broker-Secret header
       # BROKER_SHARED_SECRET: "change-me"
